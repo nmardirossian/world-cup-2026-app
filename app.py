@@ -35,7 +35,7 @@ SCORING_RULES_MD = """
 - Otherwise → 0 pts
 """
 
-BUY_IN_USD = 5
+BUY_IN_USD = 10
 PRIZE_PERCENTAGES = (0.70, 0.20, 0.10)  # 1st, 2nd, 3rd
 
 
@@ -291,11 +291,19 @@ def login_view() -> None:
         st.title("World Cup Pool")
         st.caption("Sign in")
         with st.form("login"):
-            username = st.selectbox("Username", users["Username"].tolist())
+            username = st.selectbox(
+                "Username",
+                users["Username"].tolist(),
+                index=None,
+                placeholder="Please choose your username...",
+            )
             pin = st.text_input("PIN", type="password")
             submitted = st.form_submit_button("Log in")
 
         if submitted:
+            if not username:
+                st.error("Please choose your username.")
+                return
             row = users[users["Username"] == username].iloc[0]
             if str(pin).strip() == row["PIN"]:
                 st.session_state["auth_user"] = username
@@ -337,9 +345,12 @@ def bracket_view(username: str) -> None:
         st.info(f"🔍 Admin preview — bracket isn't actually locked yet (locks at {lock_str}).")
     else:
         countdown = format_countdown(EDIT_LOCK_AT - now)
-        st.info(
-            f"Predictions lock in **{countdown}** (at {lock_str}). "
-            "Enter scores as `A-B` (e.g. `2-1`), then click **Save**."
+        st.info(f"Predictions lock in **{countdown}** (at {lock_str}). Click **Save** to commit your edits.")
+        st.markdown(
+            "<p style='font-size: 2rem; font-weight: 700; margin: 0.6rem 0;'>"
+            "Enter scores as <code>A-B</code> (e.g. <code>2-1</code>)"
+            "</p>",
+            unsafe_allow_html=True,
         )
         submitted = sum(1 for mid in matches["Match_ID"] if parse_score(user_preds.get(mid, "")))
         st.caption(f"You have submitted **{submitted} of {len(matches)}** predictions.")
