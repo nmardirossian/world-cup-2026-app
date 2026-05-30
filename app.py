@@ -84,8 +84,8 @@ def load_matches() -> pd.DataFrame:
     return df.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
 
 
-def load_predictions() -> pd.DataFrame:
-    df = get_conn().read(worksheet=PREDICTIONS_TAB, ttl=READ_TTL_SECONDS)
+def load_predictions(ttl: int = READ_TTL_SECONDS) -> pd.DataFrame:
+    df = get_conn().read(worksheet=PREDICTIONS_TAB, ttl=ttl)
     df = df.dropna(how="all")
     if df.empty:
         return pd.DataFrame(columns=["Username", "Match_ID", "Predicted_Result"])
@@ -185,11 +185,16 @@ def compute_winnings(board: pd.DataFrame) -> pd.Series:
 # ---------- Writes ---------------------------------------------------------
 
 def save_predictions_bulk(username: str, updates: list[tuple[str, str]]) -> None:
-    """Upsert many predictions in one sheet write. updates = [(match_id, "A-B"), ...]."""
+    """Upsert many predictions in one sheet write. updates = [(match_id, "A-B"), ...].
+
+    Reads with ttl=0 so back-to-back saves see each other's writes (otherwise
+    a stale cached read would overwrite the previous save). Does NOT clear the
+    app-wide cache afterwards — that would change the bracket's data prop
+    mid-edit and cause data_editor to drop unsaved keystrokes."""
     if not updates:
         return
     conn = get_conn()
-    df = load_predictions()
+    df = load_predictions(ttl=0)
     for match_id, predicted_result in updates:
         mask = (df["Username"] == username) & (df["Match_ID"] == match_id)
         if mask.any():
@@ -211,7 +216,6 @@ def save_predictions_bulk(username: str, updates: list[tuple[str, str]]) -> None
                 ignore_index=True,
             )
     conn.update(worksheet=PREDICTIONS_TAB, data=df)
-    st.cache_data.clear()
 
 
 def save_match_results(updates: dict[str, str]) -> None:
