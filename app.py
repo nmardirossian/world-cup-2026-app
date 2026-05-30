@@ -54,13 +54,10 @@ def _to_text(value: object) -> str:
     return str(value).strip()
 
 
-_normalize_pin = _to_text  # back-compat alias
-
-
 def load_users() -> pd.DataFrame:
     df = get_conn().read(worksheet=USERS_TAB, ttl=READ_TTL_SECONDS)
     df = df.dropna(how="all")
-    df["PIN"] = df["PIN"].apply(_normalize_pin)
+    df["PIN"] = df["PIN"].apply(_to_text)
     df["Username"] = df["Username"].astype(str).str.strip()
     return df[df["Username"] != ""].reset_index(drop=True)
 
@@ -71,8 +68,8 @@ def _match_sort_key(match_id: str) -> tuple[int, str]:
     return (int(digits) if digits else 10**9, str(match_id))
 
 
-def load_matches() -> pd.DataFrame:
-    df = get_conn().read(worksheet=MATCHES_TAB, ttl=READ_TTL_SECONDS)
+def load_matches(ttl: int = READ_TTL_SECONDS) -> pd.DataFrame:
+    df = get_conn().read(worksheet=MATCHES_TAB, ttl=ttl)
     df = df.dropna(how="all")
     df["Match_ID"] = df["Match_ID"].apply(_to_text)
     df = df[df["Match_ID"] != ""].copy()
@@ -219,11 +216,14 @@ def save_predictions_bulk(username: str, updates: list[tuple[str, str]]) -> None
 
 
 def save_match_results(updates: dict[str, str]) -> None:
-    """Update Actual_Result for the given match IDs. Rewrites the Matches sheet."""
+    """Update Actual_Result for the given match IDs. Rewrites the Matches sheet.
+
+    Same pattern as save_predictions_bulk: read fresh, don't clear the app-wide
+    cache afterwards (that can drop unsaved data_editor edits)."""
     if not updates:
         return
     conn = get_conn()
-    df = load_matches()
+    df = load_matches(ttl=0)
     for match_id, result in updates.items():
         df.loc[df["Match_ID"] == match_id, "Actual_Result"] = result
     # Preserve the original column order, not the natural-sort order.
@@ -231,7 +231,6 @@ def save_match_results(updates: dict[str, str]) -> None:
         worksheet=MATCHES_TAB,
         data=df[["Match_ID", "Team_A", "Team_B", "Actual_Result"]],
     )
-    st.cache_data.clear()
 
 
 def update_user_pin(username: str, new_pin: str) -> None:
@@ -340,7 +339,7 @@ def bracket_view(username: str) -> None:
         countdown = format_countdown(EDIT_LOCK_AT - now)
         st.info(
             f"Predictions lock in **{countdown}** (at {lock_str}). "
-            "Enter scores as `A-B` (e.g. `2-1`) — saves automatically when you leave a cell."
+            "Enter scores as `A-B` (e.g. `2-1`), then click **Save**."
         )
         submitted = sum(1 for mid in matches["Match_ID"] if parse_score(user_preds.get(mid, "")))
         st.caption(f"You have submitted **{submitted} of {len(matches)}** predictions.")
@@ -362,6 +361,9 @@ def bracket_view(username: str) -> None:
 
     left, _ = st.columns([3, 1])
     with left:
+        # Placeholder for the Save button. Filled in after we know how many
+        # edits are pending, so the button label can show the count.
+        save_slot = st.empty()
         edited = st.data_editor(
             original,
             column_config={
@@ -383,24 +385,46 @@ def bracket_view(username: str) -> None:
     if locked:
         return
 
+    # Per-session memory of what's been saved. Lets the Save button correctly
+    # disable itself after a save, even while the read cache is still stale.
+    last_saved = st.session_state.setdefault(f"last_saved_{username}", {})
+
     updates: list[tuple[str, str]] = []
     errors: list[str] = []
     for i, row in edited.iterrows():
+        match_id = str(row["Match_ID"])
         new_str = str(row["Predicted Score"] or "").strip()
-        old_str = str(original.iloc[i]["Predicted Score"] or "").strip()
-        if new_str == old_str or not new_str:
+        if not new_str:
             continue
         parsed = parse_score(new_str)
         if parsed is None:
-            errors.append(f"{row['Match_ID']}: '{new_str}' is not a valid score. Use A-B (e.g. 2-1).")
+            errors.append(f"{match_id}: '{new_str}' is not a valid score. Use A-B (e.g. 2-1).")
             continue
-        updates.append((str(row["Match_ID"]), f"{parsed[0]}-{parsed[1]}"))
+        normalized = f"{parsed[0]}-{parsed[1]}"
+        if last_saved.get(match_id) == normalized:
+            continue
+        orig_str = str(original.iloc[i]["Predicted Score"] or "").strip()
+        if normalized == orig_str:
+            last_saved[match_id] = normalized
+            continue
+        updates.append((match_id, normalized))
 
     for err in errors:
         st.error(err)
-    if updates:
+
+    n = len(updates)
+    button_label = f"💾 Save {n} change(s)" if n else "No changes to save"
+    if save_slot.button(
+        button_label,
+        disabled=(n == 0),
+        type="primary",
+        key=f"save_predictions_{username}",
+    ):
         save_predictions_bulk(username, updates)
-        st.toast(f"Saved {len(updates)} prediction(s) ✅")
+        for match_id, pred in updates:
+            last_saved[match_id] = pred
+        st.toast(f"Saved {n} prediction(s) ✅")
+        st.rerun()
 
 
 def all_brackets_view(username: str) -> None:
@@ -485,7 +509,10 @@ def my_results_view(username: str) -> None:
 
 def admin_view() -> None:
     st.subheader("Admin — enter match results")
-    st.caption("Format scores as `A-B` (e.g. `2-1`). Leave blank for matches not yet played. Saves automatically.")
+    st.caption(
+        "Format scores as `A-B` (e.g. `2-1`). Leave blank for matches not yet "
+        "played, then click **Save**."
+    )
     matches = load_matches()
     if matches.empty:
         st.info("No matches to manage.")
@@ -495,6 +522,7 @@ def admin_view() -> None:
 
     left, _ = st.columns([3, 1])
     with left:
+        save_slot = st.empty()
         edited = st.data_editor(
             original,
             column_config={
@@ -509,23 +537,42 @@ def admin_view() -> None:
             key="admin_results_editor",
         )
 
+    last_saved = st.session_state.setdefault("admin_last_saved_results", {})
+
     updates: dict[str, str] = {}
     errors: list[str] = []
     for i, row in edited.iterrows():
-        new = (row["Actual_Result"] or "").strip()
-        old = (original.iloc[i]["Actual_Result"] or "").strip()
-        if new == old:
+        match_id = str(row["Match_ID"])
+        new = str(row["Actual_Result"] or "").strip()
+        old = str(original.iloc[i]["Actual_Result"] or "").strip()
+        parsed = parse_score(new) if new else None
+        if new and parsed is None:
+            errors.append(f"{match_id}: '{new}' is not a valid score (use A-B).")
             continue
-        if new and parse_score(new) is None:
-            errors.append(f"{row['Match_ID']}: '{new}' is not a valid score (use A-B).")
+        normalized = f"{parsed[0]}-{parsed[1]}" if parsed else ""
+        if last_saved.get(match_id) == normalized:
             continue
-        updates[row["Match_ID"]] = new
+        if normalized == old:
+            last_saved[match_id] = normalized
+            continue
+        updates[match_id] = normalized
 
     for err in errors:
         st.error(err)
-    if updates:
+
+    n = len(updates)
+    button_label = f"💾 Save {n} change(s)" if n else "No changes to save"
+    if save_slot.button(
+        button_label,
+        disabled=(n == 0),
+        type="primary",
+        key="save_admin_results",
+    ):
         save_match_results(updates)
-        st.toast(f"Saved {len(updates)} result(s) ✅")
+        for match_id, value in updates.items():
+            last_saved[match_id] = value
+        st.toast(f"Saved {n} result(s) ✅")
+        st.rerun()
 
 
 def pin_change_form(username: str) -> None:
