@@ -68,6 +68,12 @@ def _match_sort_key(match_id: str) -> tuple[int, str]:
     return (int(digits) if digits else 10**9, str(match_id))
 
 
+def _match_id_int(value: object) -> int | None:
+    """Match_ID string → int for numeric display/sorting in tables."""
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return int(digits) if digits else None
+
+
 def load_matches(ttl: int = READ_TTL_SECONDS) -> pd.DataFrame:
     df = get_conn().read(worksheet=MATCHES_TAB, ttl=ttl)
     df = df.dropna(how="all")
@@ -77,6 +83,10 @@ def load_matches(ttl: int = READ_TTL_SECONDS) -> pd.DataFrame:
         df["Actual_Result"] = df["Actual_Result"].fillna("").astype(str).str.strip()
     else:
         df["Actual_Result"] = ""
+    if "Group" in df.columns:
+        df["Group"] = df["Group"].fillna("").astype(str).str.strip()
+    else:
+        df["Group"] = ""
     df["_sort"] = df["Match_ID"].map(_match_sort_key)
     return df.sort_values("_sort").drop(columns="_sort").reset_index(drop=True)
 
@@ -226,10 +236,11 @@ def save_match_results(updates: dict[str, str]) -> None:
     df = load_matches(ttl=0)
     for match_id, result in updates.items():
         df.loc[df["Match_ID"] == match_id, "Actual_Result"] = result
-    # Preserve the original column order, not the natural-sort order.
+    # Preserve the sheet's column order. Group is the new one between
+    # Match_ID and Team_A.
     conn.update(
         worksheet=MATCHES_TAB,
-        data=df[["Match_ID", "Team_A", "Team_B", "Actual_Result"]],
+        data=df[["Match_ID", "Group", "Team_A", "Team_B", "Actual_Result"]],
     )
 
 
@@ -361,10 +372,12 @@ def bracket_view(username: str) -> None:
         display = f"{existing[0]}-{existing[1]}" if existing else ""
         rows.append(
             {
-                "Match_ID": match["Match_ID"],
+                "Match_ID": _match_id_int(match["Match_ID"]),
+                "Group": match["Group"],
                 "Team A": match["Team_A"],
                 "Predicted Score": display,
                 "Team B": match["Team_B"],
+                "_id_str": match["Match_ID"],  # used by the save loop
             }
         )
     # Rows are already in natural Match_ID order from load_matches.
@@ -378,14 +391,17 @@ def bracket_view(username: str) -> None:
         edited = st.data_editor(
             original,
             column_config={
-                "Match_ID": st.column_config.TextColumn("Match ID", disabled=True),
+                "Match_ID": st.column_config.NumberColumn(
+                    "Match ID", disabled=True, format="%d"
+                ),
+                "Group": st.column_config.TextColumn("Group", disabled=True),
                 "Team A": st.column_config.TextColumn("Team A", disabled=True),
                 "Predicted Score": st.column_config.TextColumn(
                     "Predicted Score", help="Format: A-B (e.g. 2-1)."
                 ),
                 "Team B": st.column_config.TextColumn("Team B", disabled=True),
             },
-            column_order=["Match_ID", "Team A", "Predicted Score", "Team B"],
+            column_order=["Match_ID", "Group", "Team A", "Predicted Score", "Team B"],
             hide_index=True,
             disabled=locked,
             width="stretch",
@@ -403,7 +419,9 @@ def bracket_view(username: str) -> None:
     updates: list[tuple[str, str]] = []
     errors: list[str] = []
     for i, row in edited.iterrows():
-        match_id = str(row["Match_ID"])
+        # Use the original string Match_ID for sheet writes — keeps types
+        # consistent with the Predictions tab (which stores it as text).
+        match_id = original.iloc[i]["_id_str"]
         new_str = str(row["Predicted Score"] or "").strip()
         if not new_str:
             continue
@@ -454,17 +472,18 @@ def all_brackets_view(username: str) -> None:
     pivot = predictions.pivot_table(
         index="Match_ID", columns="Username", values="Predicted_Result", aggfunc="first"
     )
-    base = matches[["Match_ID", "Team_A", "Team_B", "Actual_Result"]].copy()
+    base = matches[["Match_ID", "Group", "Team_A", "Team_B", "Actual_Result"]].copy()
     base["Matchup"] = base["Team_A"] + " vs " + base["Team_B"]
 
     df = base.merge(pivot, on="Match_ID", how="left")
     df["_sort"] = df["Match_ID"].map(_match_sort_key)
     df = df.sort_values("_sort").drop(columns=["_sort", "Team_A", "Team_B"])
+    df["Match_ID"] = df["Match_ID"].apply(_match_id_int)
 
     user_cols = sorted([c for c in pivot.columns if c != username])
     if username in pivot.columns:
         user_cols = [username] + user_cols
-    df = df[["Match_ID", "Matchup", "Actual_Result"] + user_cols]
+    df = df[["Match_ID", "Group", "Matchup", "Actual_Result"] + user_cols]
     df = df.rename(columns={"Actual_Result": "Actual"}).fillna("—").replace({"": "—"})
 
     st.caption("Your column is shown first.")
@@ -501,7 +520,8 @@ def my_results_view(username: str) -> None:
 
         rows.append(
             {
-                "Match ID": match_id,
+                "Match ID": _match_id_int(match_id),
+                "Group": m["Group"],
                 "Team A": m["Team_A"],
                 "Predicted Result": f"{predicted[0]}-{predicted[1]}" if predicted else "—",
                 "Team B": m["Team_B"],
@@ -529,7 +549,9 @@ def admin_view() -> None:
         st.info("No matches to manage.")
         return
 
-    original = matches[["Match_ID", "Team_A", "Team_B", "Actual_Result"]].copy()
+    original = matches[["Match_ID", "Group", "Team_A", "Team_B", "Actual_Result"]].copy()
+    original["_id_str"] = original["Match_ID"]
+    original["Match_ID"] = original["Match_ID"].apply(_match_id_int)
 
     left, _ = st.columns([3, 1])
     with left:
@@ -537,11 +559,15 @@ def admin_view() -> None:
         edited = st.data_editor(
             original,
             column_config={
-                "Match_ID": st.column_config.TextColumn("Match ID", disabled=True),
+                "Match_ID": st.column_config.NumberColumn(
+                    "Match ID", disabled=True, format="%d"
+                ),
+                "Group": st.column_config.TextColumn("Group", disabled=True),
                 "Team_A": st.column_config.TextColumn("Team A", disabled=True),
                 "Team_B": st.column_config.TextColumn("Team B", disabled=True),
                 "Actual_Result": st.column_config.TextColumn("Actual Result"),
             },
+            column_order=["Match_ID", "Group", "Team_A", "Team_B", "Actual_Result"],
             hide_index=True,
             width="stretch",
             height=table_height(len(original)),
@@ -553,7 +579,7 @@ def admin_view() -> None:
     updates: dict[str, str] = {}
     errors: list[str] = []
     for i, row in edited.iterrows():
-        match_id = str(row["Match_ID"])
+        match_id = original.iloc[i]["_id_str"]
         new = str(row["Actual_Result"] or "").strip()
         old = str(original.iloc[i]["Actual_Result"] or "").strip()
         parsed = parse_score(new) if new else None
